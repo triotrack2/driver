@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Find My Bus - User Portal</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <style>
+        #map-container { display: none; height: 400px; margin-top: 20px; border-radius: 10px; border: 2px solid #198754; position: relative; }
+        #map { height: 100%; width: 100%; border-radius: 8px; }
+        .bus-card { border-left: 5px solid #0d6efd; transition: 0.2s; }
+        .bus-card:hover { transform: translateY(-2px); box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        .suggestion-item { cursor: pointer; }
+    </style>
+</head>
+<body class="bg-light">
+
+<nav class="navbar navbar-dark bg-primary mb-4 shadow">
+    <div class="container">
+        <span class="navbar-brand fw-bold">🚍 TrioTrack User</span>
+    </div>
+</nav>
+
+<div class="container">
+    
+    <div class="card p-4 shadow-sm">
+        <h5 class="mb-3">Search Route</h5>
+        
+        <div class="mb-3">
+            <label class="form-label small text-muted">Bus Type</label>
+            <select id="categoryFilter" class="form-select">
+                <option value="All">All Bus Types</option>
+                <option value="Public Bus (KSRTC)">Public Bus (KSRTC)</option>
+                <option value="Private Bus">Private Bus</option>
+            </select>
+        </div>
+
+        <div class="row g-2">
+            <div class="col-md-5">
+                <input type="text" id="source" class="form-control" placeholder="From (e.g. Stop A)" list="stopOptions">
+            </div>
+            
+            <div class="col-md-5">
+                <input type="text" id="destination" class="form-control" placeholder="To (e.g. Stop B)" list="stopOptions">
+            </div>
+            
+            <div class="col-md-2">
+                <button id="searchBtn" class="btn btn-dark w-100">Find Bus</button>
+            </div>
+        </div>
+
+        <datalist id="stopOptions">
+            </datalist>
+    </div>
+
+    <div id="map-container" class="card p-2">
+        <div class="d-flex justify-content-between p-2">
+            <h5 class="text-success fw-bold" id="map-title">Live Tracking</h5>
+            <button id="closeMapBtn" class="btn btn-sm btn-danger">Close Map</button>
+        </div>
+        <div id="map"></div>
+        <p class="text-center small text-muted mt-1">Map updates automatically.</p>
+    </div>
+
+    <div id="results" class="mt-4"></div>
+
+    <footer class="text-center mt-5 mb-4">
+        <hr>
+        <p class="text-muted small">© 2024 TrioTrack</p>
+        <a href="admin.html" class="text-decoration-none text-secondary small">Admin Login</a>
+    </footer>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+    import { getFirestore, collection, getDocs, doc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+    // 1. FIREBASE CONFIG
+    const firebaseConfig = {
+      apiKey: "AIzaSyDcWwo0m2eS1ndyC06U1G_JF1J7Y1WNlfQ",
+      authDomain: "triotrack-66dd6.firebaseapp.com",
+      projectId: "triotrack-66dd6",
+      storageBucket: "triotrack-66dd6.firebasestorage.app",
+      messagingSenderId: "994389952848",
+      appId: "1:994389952848:web:659fbc330f2d660dfb0455",
+      measurementId: "G-B7TMFX0F21"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+
+    let map = null;
+    let marker = null;
+    let unsubscribe = null;
+    let allRoutesData = []; // Store data locally to avoid re-fetching constantly
+
+    // 2. INITIALIZE: FETCH STOPS FOR DROPDOWN
+    async function loadStops() {
+        try {
+            const snapshot = await getDocs(collection(db, "routes"));
+            const stopsSet = new Set(); // Use a Set to store unique names
+            
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                allRoutesData.push(data); // Save for search logic
+                
+                // Extract every stop name from the route array
+                if (data.route && Array.isArray(data.route)) {
+                    data.route.forEach(stop => {
+                        if (stop.name) stopsSet.add(stop.name.trim());
+                    });
+                }
+            });
+
+            // Populate Datalist
+            const dataList = document.getElementById('stopOptions');
+            stopsSet.forEach(stopName => {
+                const option = document.createElement('option');
+                option.value = stopName;
+                dataList.appendChild(option);
+            });
+
+            console.log("Stops loaded:", stopsSet.size);
+
+        } catch (error) {
+            console.error("Error loading stops:", error);
+        }
+    }
+
+    // Load stops as soon as page opens
+    loadStops();
+
+    // 3. SEARCH LOGIC
+    document.getElementById('searchBtn').addEventListener('click', () => {
+        const src = document.getElementById('source').value.toLowerCase().trim();
+        const dst = document.getElementById('destination').value.toLowerCase().trim();
+        const categoryFilter = document.getElementById('categoryFilter').value; // Get Category
+        const resDiv = document.getElementById('results');
+        
+        if (!src || !dst) return alert("Please enter both Source and Destination");
+        
+        resDiv.innerHTML = "<div class='text-center mt-3'><div class='spinner-border text-primary'></div><p>Searching...</p></div>";
+
+        let html = "";
+        let count = 0;
+
+        // Loop through the data we already fetched
+        allRoutesData.forEach(d => {
+            // 1. Check Category Filter
+            if (categoryFilter !== "All" && d.category !== categoryFilter) {
+                return; // Skip this bus if category doesn't match
+            }
+
+            // 2. Check Route Matches
+            const keywords = d.searchKeywords || [];
+            const sIdx = keywords.indexOf(src);
+            const dIdx = keywords.indexOf(dst);
+
+            // Logic: Both stops exist AND Start is before End
+            if (sIdx !== -1 && dIdx !== -1 && sIdx < dIdx) {
+                count++;
+                
+                // Get display times
+                const t1Obj = d.route.find(r => r.name.toLowerCase() === src);
+                const t2Obj = d.route.find(r => r.name.toLowerCase() === dst);
+                const t1 = t1Obj ? t1Obj.time : "N/A";
+                const t2 = t2Obj ? t2Obj.time : "N/A";
+
+                html += `
+                    <div class="card mb-3 bus-card shadow-sm">
+                        <div class="card-body">
+                            <div class="d-flex justify-content-between">
+                                <h5 class="fw-bold text-primary">${d.busName} <small class="text-muted">(${d.busNumber})</small></h5>
+                                <span class="badge bg-secondary">${d.category}</span>
+                            </div>
+                            <div class="row mt-3">
+                                <div class="col">
+                                    <small class="text-muted">Departure from ${t1Obj.name}</small><br>
+                                    <strong>${t1}</strong>
+                                </div>
+                                <div class="col">
+                                    <small class="text-muted">Arrival at ${t2Obj.name}</small><br>
+                                    <strong>${t2}</strong>
+                                </div>
+                                <div class="col text-end align-self-center">
+                                    <button class="btn btn-success btn-sm track-btn" data-bus="${d.busNumber}">📍 Track Live</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>`;
+            }
+        });
+
+        resDiv.innerHTML = count > 0 ? html : "<div class='alert alert-warning text-center'>No buses found for this route and category.</div>";
+
+        // Re-attach listeners to new buttons
+        document.querySelectorAll('.track-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => track(e.target.getAttribute('data-bus')));
+        });
+    });
+
+    // 4. TRACKING LOGIC
+    function track(busNum) {
+        const mapDiv = document.getElementById('map-container');
+        mapDiv.style.display = 'block';
+        document.getElementById('map-title').innerText = `Tracking: ${busNum}`;
+        mapDiv.scrollIntoView({ behavior: 'smooth' });
+
+        if (!map) {
+            map = L.map('map').setView([10.0, 76.0], 10);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
+        }
+        
+        setTimeout(() => map.invalidateSize(), 100);
+
+        if (unsubscribe) unsubscribe();
+        if (marker) map.removeLayer(marker);
+
+        unsubscribe = onSnapshot(doc(db, "locations", busNum), (docSnapshot) => {
+            if (docSnapshot.exists()) {
+                const { lat, lng } = docSnapshot.data();
+                if (marker) {
+                    marker.setLatLng([lat, lng]);
+                } else {
+                    marker = L.marker([lat, lng]).addTo(map).bindPopup(`<b>${busNum}</b>`).openPopup();
+                }
+                map.setView([lat, lng], 15);
+            } else { 
+                alert("GPS Signal Lost: This bus is offline.");
+            }
+        });
+    }
+
+    // Close Map
+    document.getElementById('closeMapBtn').addEventListener('click', () => {
+        document.getElementById('map-container').style.display = 'none';
+        if (unsubscribe) unsubscribe();
+    });
+</script>
+</body>
+</html>
